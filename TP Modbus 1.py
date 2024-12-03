@@ -1,75 +1,221 @@
 import serial
-import struct
-import time
 
-# Fonction pour calculer le CRC Modbus
 def calculate_crc(data):
+    """
+    Calcul du CRC16 Modbus
+    """
     crc = 0xFFFF
-    for pos in data:
-        crc ^= pos
+    for byte in data:
+        crc ^= byte
         for _ in range(8):
-            if (crc & 0x0001) != 0:
-                crc >>= 1
-                crc ^= 0xA001
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
             else:
                 crc >>= 1
-    return crc
+    return crc & 0xFFFF
 
-# Configurer le port série pour COM1 (envoi)
-ser_com1 = serial.Serial(
-    port='COM1',         # Utiliser COM1 pour envoyer la trame
-    baudrate=9600,       # Baudrate : 9600 bauds
-    bytesize=serial.EIGHTBITS,  # 8 bits de données
-    parity=serial.PARITY_NONE,  # Pas de parité
-    stopbits=serial.STOPBITS_ONE,  # 1 bit de stop
-    timeout=1            # Timeout pour la lecture
-)
+def validate_crc(data):
+    """
+    Valide le CRC d'une trame reçue
+    """
+    if len(data) < 3:
+        return False
+    received_crc = (data[-1] << 8) | data[-2]
+    calculated_crc = calculate_crc(data[:-2])
+    return received_crc == calculated_crc
 
-# Configurer le port série pour COM2 (lecture)
-ser_com2 = serial.Serial(
-    port='COM2',         # Utiliser COM2 pour lire la trame
-    baudrate=9600,       # Baudrate : 9600 bauds
-    bytesize=serial.EIGHTBITS,  # 8 bits de données
-    parity=serial.PARITY_NONE,  # Pas de parité
-    stopbits=serial.STOPBITS_ONE,  # 1 bit de stop
-    timeout=1            # Timeout pour la lecture
-)
+def read_response(port):
+    """
+    Lit la réponse du port série et valide le CRC
+    """
+    try:
+        response = port.read(256)  # Lire jusqu'à 256 octets
+        if len(response) == 0:
+            print("Aucune réponse reçue.")
+            return
 
-# Trame Modbus à envoyer (sans CRC pour le moment)
-trame = [0x01, 0x01, 0x01, 0x0F, 0x00, 0x10]
+        response = list(response)  # Convertir en liste d'octets
+        print("Réponse reçue :", ' '.join(f"{byte:02X}" for byte in response))
 
-# Calcul du CRC et ajout à la trame
-crc = calculate_crc(trame)
-crc_bytes = struct.pack('<H', crc)  # Conversion du CRC en 2 octets (little-endian)
-trame.extend(crc_bytes)  # Ajouter le CRC à la trame
+        if validate_crc(response):
+            print("CRC valide. Réponse correcte.")
+        else:
+            print("CRC invalide. Réponse corrompue.")
+    except Exception as e:
+        print("Erreur lors de la lecture de la réponse :", e)
 
-# Envoyer la trame via COM1
-ser_com1.write(bytearray(trame))
-print("Trame envoyée sur COM1:", ' '.join(format(x, '02X') for x in trame))
+def build_trame_mission(robot_id, number_of_operations, operations):
+    """
+    Construit la trame Modbus pour écrire des missions
+    """
+    trame = [robot_id, 0x10, 0x00, 0x13, 0x00, 1 + len(operations), (1 + len(operations)) * 2]
+    trame.extend([0x00, number_of_operations])  # Ajout de W20 (nombre d'opérations)
+    for travail, station in operations:
+        value = (travail << 8) | station  # Combine travail et station
+        trame.extend([(value >> 8) & 0xFF, value & 0xFF])  # Ajoute les octets (poids fort et faible)
 
-# Attendre un moment pour donner le temps à COM2 de recevoir les données
-time.sleep(1)
+    crc = calculate_crc(trame)
+    trame.extend([crc & 0xFF, (crc >> 8) & 0xFF])  # CRC
+    return trame
 
-# Lecture de la trame via COM2
-response = ser_com2.read(8)  # Lire 8 octets (en fonction de la longueur de la réponse attendue)
-if response:
-    print("Trame reçue sur COM2 : ", ' '.join(format(x, '02X') for x in response))
-    
-    # Séparer les données et le CRC reçu
-    received_data = response[:-2]  # Données sans les 2 derniers octets (CRC)
-    received_crc = struct.unpack('<H', response[-2:])[0]  # CRC reçu (2 derniers octets)
-    
-    # Calculer le CRC des données reçues
-    calculated_crc = calculate_crc(received_data)
-    
-    # Comparer le CRC calculé avec le CRC reçu
-    if calculated_crc == received_crc:
-        print(f"CRC valide : {hex(received_crc)}")
-    else:
-        print(f"Erreur CRC : CRC reçu = {hex(received_crc)}, CRC calculé = {hex(calculated_crc)}")
-else:
-    print("Aucune réponse reçue sur COM2.")
+def build_trame_launch(robot_id):
+    """
+    Construit la trame Modbus pour lancer une mission (écriture d’un bit, bit 272)
+    """
+    trame = [robot_id, 0x05, 0x01, 0x0F, 0xFF, 0x00]
+    crc = calculate_crc(trame)
+    trame.extend([crc & 0xFF, (crc >> 8) & 0xFF])  # CRC
+    return trame
 
-# Fermer les ports série après l'envoi et la lecture
-ser_com1.close()
-ser_com2.close()
+def build_trame_read_tor(robot_id):
+    """
+    Construit une trame standard pour lire les variables TOR de 271 à 287
+    """
+    # Adresse de départ = 271 (0x010F), Nombre de bits = 17 (0x11)
+    trame = [robot_id, 0x02, 0x01, 0x0F, 0x00, 0x11]
+    crc = calculate_crc(trame)
+    trame.extend([crc & 0xFF, (crc >> 8) & 0xFF])  # CRC
+    return trame
+
+def main():
+    # Configuration du port série
+    port = serial.Serial(
+        port='COM2',
+        baudrate=9600,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_ODD,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=1
+    )
+
+    while True:
+        print("\n=== Menu Principal ===")
+        print("1. Écrire des missions")
+        print("2. Lancer une mission")
+        print("3. Lire l'état des variables TOR (271 à 287)")
+        print("X. Quitter")
+
+        choice = input("Choisissez une option : ").strip().upper()
+
+        if choice == '1':  # Écrire des missions
+            while True:
+                try:
+                    robot_id = int(input("Numéro du robot (1-4) : "))
+                    if 1 <= robot_id <= 4:
+                        break
+                    print("Veuillez entrer un numéro valide (entre 1 et 4).")
+                except ValueError:
+                    print("Veuillez entrer un nombre entier valide.")
+
+            while True:
+                try:
+                    number_of_operations = int(input("Nombre de missions (1-3) : "))
+                    if 1 <= number_of_operations <= 3:
+                        break
+                    print("Le nombre de missions doit être compris entre 1 et 3.")
+                except ValueError:
+                    print("Veuillez entrer un nombre entier valide.")
+
+            operations = []
+            for i in range(number_of_operations):
+                while True:
+                    try:
+                        travail = int(input(f"Mission {i+1} - Travail (0=Rien, 1=Chargement, 2=Déchargement) : "))
+                        if 0 <= travail <= 2:
+                            break
+                        print("Le travail doit être compris entre 0 et 2.")
+                    except ValueError:
+                        print("Veuillez entrer un nombre entier valide.")
+                
+                while True:
+                    try:
+                        station = int(input(f"Mission {i+1} - Station (1-255) : "))
+                        if 1 <= station <= 255:
+                            operations.append((travail, station))
+                            break
+                        print("La station doit être comprise entre 1 et 255.")
+                    except ValueError:
+                        print("Veuillez entrer un nombre entier valide.")
+
+            trame_mission = build_trame_mission(robot_id, number_of_operations, operations)
+            print("Trame mission générée :", ' '.join(f"{byte:02X}" for byte in trame_mission))
+
+            while True:
+                envoyer = input("Voulez-vous envoyer cette trame ? (oui/non/X pour revenir au menu) : ").strip().lower()
+                if envoyer == 'oui':
+                    port.write(bytearray(trame_mission))
+                    print("Trame mission envoyée.")
+                    read_response(port)
+                    break
+                elif envoyer == 'non':
+                    print("En attente de confirmation pour l'envoi...")
+                elif envoyer == 'x':
+                    break
+                else:
+                    print("Réponse non valide.")
+
+        elif choice == '2':  # Lancer une mission
+            while True:
+                try:
+                    robot_id = int(input("Numéro du robot (1-4) : "))
+                    if 1 <= robot_id <= 4:
+                        break
+                    print("Veuillez entrer un numéro valide (entre 1 et 4).")
+                except ValueError:
+                    print("Veuillez entrer un nombre entier valide.")
+
+            trame_launch = build_trame_launch(robot_id)
+            print("Trame lancement générée :", ' '.join(f"{byte:02X}" for byte in trame_launch))
+
+            while True:
+                envoyer = input("Voulez-vous envoyer cette trame ? (oui/non/X pour revenir au menu) : ").strip().lower()
+                if envoyer == 'oui':
+                    port.write(bytearray(trame_launch))
+                    print("Mission lancée avec succès.")
+                    read_response(port)
+                    break
+                elif envoyer == 'non':
+                    print("En attente de confirmation pour lancer la mission...")
+                elif envoyer == 'x':
+                    break
+                else:
+                    print("Réponse non valide.")
+
+        elif choice == '3':  # Lire l'état des variables TOR
+            while True:
+                try:
+                    robot_id = int(input("Numéro du robot (1-4) : "))
+                    if 1 <= robot_id <= 4:
+                        break
+                    print("Veuillez entrer un numéro valide (entre 1 et 4).")
+                except ValueError:
+                    print("Veuillez entrer un nombre entier valide.")
+
+            trame_read = build_trame_read_tor(robot_id)
+            print("Trame lecture générée :", ' '.join(f"{byte:02X}" for byte in trame_read))
+
+            while True:
+                envoyer = input("Voulez-vous envoyer cette trame ? (oui/non/X pour revenir au menu) : ").strip().lower()
+                if envoyer == 'oui':
+                    port.write(bytearray(trame_read))
+                    print("Trame de lecture envoyée.")
+                    read_response(port)
+                    break
+                elif envoyer == 'non':
+                    print("En attente de confirmation pour envoyer la lecture...")
+                elif envoyer == 'x':
+                    break
+                else:
+                    print("Réponse non valide.")
+
+        elif choice == 'X':  # Quitter
+            print("Fin du programme.")
+            break
+
+        else:
+            print("Choix invalide. Veuillez réessayer.")
+
+    port.close()
+
+if __name__ == "__main__":
+    main()
